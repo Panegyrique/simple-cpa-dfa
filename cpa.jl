@@ -21,11 +21,18 @@ function plot_traces(data; num_traces::Int=5, chunk_size::Int=10000)
         plot!(p, x, trace_data)
     end
     
+    sample = size(data)[2]
+    
     plot!(p, 
-        xlabel="t", 
-        ylabel="V", 
+        xlabel="Time", 
+        ylabel="mA", 
         grid=true,
+        title="Raw traces - $sample points",
+        left_margin=10Plots.mm, 
+        bottom_margin=10Plots.mm
     )
+
+    savefig(p, "raw_traces-$sample.png")
 
     display(p)
 end
@@ -87,21 +94,21 @@ function correlation_power_analysis(plaintexts, traces;
     bytes_guesses_evolution = zeros(16, 256, number_step)
     correlation_over_time = zeros(16, 256, number_points)
 
-    pbar = ProgressBar(1:16*256)
+    pbar = ProgressBar(1:16*256*number_step)
 
     for byte_index in 1:16
         for hypothesis in 0x00:0xff
-            set_postfix(pbar, Byte=@sprintf("%d/16", byte_index), Hypothesis=@sprintf("%d / 256", hypothesis + 1))
-            update(pbar)
-
             theorical_power = [
                 theoretical_power_leakage(hypothesis, plaintexts[trace_index, byte_index], 
                                           sbox, hamming_weights) 
                 for trace_index in 1:number_traces
             ]
             
-            for i in 1:number_step
-                num_traces_to_use = i * step_size
+            for step in 1:number_step
+                set_postfix(pbar, Byte=@sprintf("%d/16", byte_index), Hypothesis=@sprintf("%d / 256", hypothesis + 1), Step=@sprintf("%d/%d", step, number_step))
+                update(pbar)
+
+                num_traces_to_use = step * step_size
                 
                 point_correlation = [
                     optimized_pearson_correlation(
@@ -111,7 +118,7 @@ function correlation_power_analysis(plaintexts, traces;
                     for point_index in 1:number_points
                 ]
                 
-                bytes_guesses_evolution[byte_index, hypothesis+1, i] = maximum(abs.(point_correlation))
+                bytes_guesses_evolution[byte_index, hypothesis+1, step] = maximum(abs.(point_correlation))
                 correlation_over_time[byte_index, hypothesis+1, :] = point_correlation
             end
         end
@@ -124,7 +131,7 @@ function correlation_power_analysis(plaintexts, traces;
 end
 
 
-function plot_correlation(octet, correlation_over_time, recover_key)
+function plot_hypothesis(octet, correlation_over_time, recover_key)
     num_hypothesis, num_points = size(correlation_over_time[octet, :, :])
     
     x = 1:num_points
@@ -144,35 +151,120 @@ function plot_correlation(octet, correlation_over_time, recover_key)
     end
 
     y_best = correlation_over_time[octet, best_hypothesis, :]
-    plot!(p2, x, y_best, color=:green, linewidth=2, label="Best Hypothesis: $best_hypothesis")
+    hex_values = "0x" * string(Int(best_hypothesis) - 1, base=16, pad=2)
+    plot!(p2, x, y_best, color=:green, linewidth=2, label="Best hypothesis: $hex_values")
     
-    plot!(p1, xlabel="Time", ylabel="Correlation", title="All Hypotheses for Byte $octet", grid=true)
-    plot!(p2, xlabel="Time", ylabel="Correlation", title="Best Hypothesis for Byte $octet", grid=true, 
-          left_margin=10Plots.mm, bottom_margin=10Plots.mm)
+    sample = size(correlation_over_time)[3]
+
+    plot!(p1, xlabel="Time", ylabel="Correlation", title="Hypotheses for byte $byte - $sample points", grid=true, left_margin=10Plots.mm, bottom_margin=10Plots.mm)
+    plot!(p2, xlabel="Time", ylabel="Correlation", title="Best hypothesis for byte $byte - $sample points", grid=true, left_margin=10Plots.mm, bottom_margin=10Plots.mm)
+
+    savefig(p1, "hypotheses_for_byte_$octet-$sample.png")
+    savefig(p2, "best_hypothesis_for_byte_$octet-$sample.png")
 
     display(plot(p1, p2, layout=@layout([a{0.5h}; b{0.5h}]), size=(1200, 1300)))
 end
 
 
+function plot_correlation_evolution(byte_index, plaintexts, traces, number_step)
+    number_traces, number_points = size(traces)
+    sbox = get_sbox()
+    hamming_weights = [hamming_weight(UInt8(n)) for n in 0x00:0xff] # precompute hamming weights
+    
+    recover_key = zeros(UInt8, 16)
+    step_size = number_traces ÷ number_step
+    bytes_guesses_evolution = zeros(16, 256, number_step)
+    correlation_over_time = zeros(16, 256, number_points)
+
+    pbar = ProgressBar(1:256*number_step)
+
+    for hypothesis in 0x00:0xff
+        theorical_power = [
+            theoretical_power_leakage(hypothesis, plaintexts[trace_index, byte_index], 
+                                      sbox, hamming_weights) 
+            for trace_index in 1:number_traces
+        ]
+        
+        for step in 1:number_step
+            set_postfix(pbar, Byte=@sprintf("%d", byte_index), Hypothesis=@sprintf("%d / 256", hypothesis + 1), Step=@sprintf("%d/%d", step, number_step))
+            update(pbar)
+
+            num_traces_to_use = step * step_size
+            
+            point_correlation = [
+                optimized_pearson_correlation(
+                    theorical_power[1:num_traces_to_use], 
+                    traces[1:num_traces_to_use, point_index]
+                ) 
+                for point_index in 1:number_points
+            ]
+            
+            bytes_guesses_evolution[byte_index, hypothesis+1, step] = maximum(abs.(point_correlation))
+            correlation_over_time[byte_index, hypothesis+1, :] = point_correlation
+        end
+    end
+
+    x = [(i) * step_size for i in 1:number_step]
+    p = plot(size=(1200, 600), legend=true)
+    
+    final_correlations = bytes_guesses_evolution[byte_index, :, end]
+    best_hypothesis = argmax(final_correlations)
+    recover_key[byte_index] = best_hypothesis - 1
+    
+    for hypothesis in 1:256
+        if hypothesis != best_hypothesis
+            correlation_values = bytes_guesses_evolution[byte_index, hypothesis, :]
+            plot!(p, x, correlation_values, 
+                color=:gray, 
+                alpha=0.3, 
+                linewidth=1, 
+                label="")
+        end
+    end
+    
+    hex_value = "0x" * string(Int(best_hypothesis - 1), base=16, pad=2)
+    best_correlation_values = bytes_guesses_evolution[byte_index, best_hypothesis, :]
+    plot!(p, x, best_correlation_values, 
+        color=:green, 
+        linewidth=2, 
+        label="Best hypothesis: $hex_value")
+    
+    plot!(p, 
+        xlabel="Number of traces used",
+        ylabel="Correlation",
+        title="Correlation trends for the 256 hypotheses - Byte $(byte_index)",
+        grid=true,
+        left_margin=10Plots.mm,
+        bottom_margin=10Plots.mm)
+
+    savefig(p, "correlation_evolution_byte_$byte_index-$number_step.png")
+    
+    display(p)
+end
+
+
 # Load data
-plaintext = npzread("./pts.npy")
+plaintext = npzread("./data/cpa/2000-samples/pts.npy")
 println("Inputs shape: ", size(plaintext))
-traces = npzread("./traces.npy")
+traces = npzread("./data/cpa/2000-samples/traces.npy")
 println("Traces shape: ", size(traces))
 
-# Plot raw traces
-# plot_traces(traces, num_traces=50, chunk_size=50_000)
+# Raw traces
+plot_traces(traces, num_traces=1, chunk_size=50_000)
 
-# Launch CPA
-recover_key, _, correlation_over_time = correlation_power_analysis(plaintext, traces)
+# CPA
+recover_key, bytes_guesses_evolution, correlation_over_time = correlation_power_analysis(plaintext, traces, number_step = 2)
 
-# Print result
+# Print results
 hex_values = ["0x" * string(Int(val), base=16, pad=2) for val in recover_key]
 ascii_string = join([Char(val) for val in recover_key])
 println("\nRecovered Key (Hex): ", hex_values)
 println("Recovered Key (ASCII): ", ascii_string)
 
-# Plot all correlation
+# Plot of all correlations
 for byte in 1:16
-    plot_correlation(byte, correlation_over_time, recover_key)
+    plot_hypothesis(byte, correlation_over_time, recover_key)
 end
+
+# Plot of correlation evolution for byte 5 as a function of the number of traces
+plot_correlation_evolution(5, plaintext, traces, 80)
